@@ -22,5 +22,6 @@ message GetRequest {
 
 message GetResponse {
     string value = 1;
-    bool found = 2;
+    int32 version = 2;
+    bool found = 3;
 }

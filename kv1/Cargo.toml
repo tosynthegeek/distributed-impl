@@ -12,9 +12,14 @@ name = "kv-client"
 path = "src/client.rs"
 
 [dependencies]
-tonic = "*"
-prost = "0.14"
+tonic = "0.12"          # Use 0.12 (more stable than 0.13)
+prost = "0.13"   
 tokio = { version = "1.0", features = ["full"] }
+dashmap = "6.1.0"
+thiserror = "2"
+clap = { version = "4.5.41", features = ["derive"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
 
 [build-dependencies]
-tonic-build = "*"
+tonic-build = "0.12" 
