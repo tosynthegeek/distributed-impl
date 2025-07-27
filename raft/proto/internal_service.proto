@@ -1,0 +1,110 @@
+syntax = "proto3";
+package raft.internal;
+
+service RaftInternalService {
+    rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+message AppendEntriesRequest {
+    int32 term = 1;
+    string leaderId = 2;
+    int32 prev_log_index = 3;
+    int32 prev_log_term = 4;
+    repeated LogEntry entries = 5;
+    int32 leader_commit = 6;
+}
+
+message LogEntry {
+    int32 term = 1;
+    int32 index = 2;
+    oneof entry_type {
+        ClientCommand client_command = 3;
+        ConfigurationChange config_change = 4;
+        NoOpEntry no_op = 5;  // Used by new leaders
+    }
+}
+
+message AppendEntriesResponse {
+    int32 term = 1;
+    bool success = 2;
+}
+
+message RequestVoteRequest {
+    int32 term = 1;
+    string candidate_id = 2;
+    int32 last_log_index = 3;
+    int32 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+    int32 term = 1;
+    bool vote_granted = 2;
+}
+
+message NoOpEntry {
+
+}
+
+message ClientCommand {
+    string key = 1;
+    string value = 2;
+    CommandType command_type = 3;
+}
+
+enum CommandType {
+    PUT = 0;
+    DELETE = 1;
+    GET = 2;
+}
+
+
+message ConfigurationChange {
+    ClusterConfiguration new_configuration = 2;
+    ClusterConfiguration old_configuration = 3;
+}
+
+message ClusterConfiguration {
+    repeated ServerConfiguration servers = 1;
+    int64 configuration_index = 2;  // Log index where this config was committed
+    string configuration_id = 3;   // Unique ID for this configuration
+}
+
+message ServerConfiguration {
+    string server_id = 1;
+    string internal_address = 2; 
+    string client_address = 3; 
+    ServerRole role = 4;
+    ServerState state = 5;
+}
+
+enum ServerRole {
+    VOTING_MEMBER = 0;
+    NON_VOTING_MEMBER = 1;  
+    LEARNER = 2;  
+}
+
+enum ServerState {
+    ACTIVE = 0;
+    JOINING = 1;  
+    LEAVING = 2; 
+    INACTIVE = 3;
+}
+
+message InstallSnapshotRequest {
+    int32 term = 1;
+    string leader_id = 2;
+    int32 last_included_index = 3;
+    int32 last_included_term = 4;
+    int64 offset = 5;                    
+    bytes data = 6;
+    bool done = 7;
+}
+
+message InstallSnapshotResponse {
+    int32 term = 1;
+    bool success = 2;
+    int64 bytes_received = 3;
+    string error_message = 4;
+}

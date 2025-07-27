@@ -3,4 +3,18 @@ name = "raft"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]] # Bin to run the raft gRPC server
+name = "raft-server"
+path = "src/server.rs"
+
+[[bin]] # Bin to run the raft gRPC server
+name = "raft-client"
+path = "src/client.rs"
+
 [dependencies]
+tonic = "0.12"          # Use 0.12 (more stable than 0.13)
+prost = "0.13"   
+tokio = { version = "1.0", features = ["full"] }
+
+[build-dependencies]
+tonic-build = "0.12" 

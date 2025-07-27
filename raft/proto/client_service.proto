@@ -1,0 +1,104 @@
+// client_service.proto - Client-facing API
+syntax = "proto3";
+package raft.client;
+
+service ClientService {
+    rpc Put(PutRequest) returns (PutResponse);
+    rpc Get(GetRequest) returns (GetResponse);
+    rpc Delete(DeleteRequest) returns (DeleteResponse);
+    
+    rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
+    rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
+}
+
+message PutRequest {
+    string key = 1;
+    string value = 2;
+}
+
+message DeleteRequest {
+    string key = 1;
+}
+
+message DeleteResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+
+message PutResponse {
+    bool success = 1;
+    string error_message = 2;
+    string leader_address = 3; 
+}
+
+message GetRequest {
+    string key = 1;
+    bool consistent_read = 2; 
+}
+
+message GetResponse {
+    bool success = 1;
+    string value = 2;
+    string error_message = 3;
+    string leader_address = 4;
+}
+
+message GetClusterStatusRequest {}
+
+message GetClusterStatusResponse {
+    string leader_id = 1;
+    repeated NodeStatus nodes = 2;
+    int32 current_term = 3;
+    int32 commit_index = 4;
+}
+
+message NodeStatus {
+    string node_id = 1;
+    string address = 2;
+    string state = 3;  // "leader", "follower", "candidate"
+    bool is_healthy = 4;
+}
+
+message UpdateConfigRequest {
+    ConfigurationChange config_change = 1;
+    string change_id = 2;
+}
+
+message ConfigurationChange {
+    ClusterConfiguration new_configuration = 2;
+    ClusterConfiguration old_configuration = 3;
+}
+
+message ClusterConfiguration {
+    repeated ServerConfiguration servers = 1;
+    int64 configuration_index = 2;  // Log index where this config was committed
+    string configuration_id = 3;   // Unique ID for this configuration
+}
+
+message ServerConfiguration {
+    string server_id = 1;
+    string internal_address = 2; 
+    string client_address = 3; 
+    ServerRole role = 4;
+    ServerState state = 5;
+}
+
+enum ServerRole {
+    VOTING_MEMBER = 0;
+    NON_VOTING_MEMBER = 1;  
+    LEARNER = 2;  
+}
+
+enum ServerState {
+    ACTIVE = 0;
+    JOINING = 1;  
+    LEAVING = 2; 
+    INACTIVE = 3;
+}
+
+message UpdateConfigResponse {
+    bool success = 1;
+    string error_message = 2;
+    string leader_address = 3; 
+}
