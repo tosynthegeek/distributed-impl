@@ -44,8 +44,10 @@ message LogEntry {
     }
 }
 
-message NoOpEntry {
-
+enum NoOpEntry {
+    UNKNOWN = 0;
+    LEADER_HEARTBEAT = 1; // Confirms leadership (term change or periodic)
+    FORCE_COMMIT = 2;     // Used to help commit previous logs
 }
 
 message ClientCommand {
