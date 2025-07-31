@@ -62,6 +62,8 @@ impl ClientService for ClientServiceImpl {
             entry_type: Some(EntryType::ClientCommand(client_command.clone())),
         });
 
+        info!("Log entry added: {:?}", node.log.last());
+
         let leader_id = if node.state == NodeState::Leader {
             node.id.clone()
         } else {

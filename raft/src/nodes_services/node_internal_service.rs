@@ -5,7 +5,7 @@ use crate::{
     client_service::NodeState,
     internal_service::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse,
+        InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse, log_entry::EntryType,
         raft_internal_service_server::RaftInternalService,
     },
 };
@@ -78,6 +78,20 @@ impl RaftInternalService for RaftInternalServiceImpl {
             }));
         }
 
+        let entry = req.entries.last().cloned().unwrap();
+        let entry_type = entry.entry_type.clone().unwrap();
+        match entry_type {
+            EntryType::NoOp(e) => {
+                info!("Received NoOp entry: {:?}", e);
+                if e == 1 {
+                    node.apply_committed_entries();
+                }
+            }
+            _ => {
+                info!("Received leader heartbeat log");
+            }
+        }
+
         if !req.entries.is_empty() {
             node.log.truncate(req.prev_log_index as usize);
             node.log.extend(req.entries);
@@ -127,6 +141,10 @@ impl RaftInternalService for RaftInternalServiceImpl {
         if can_vote && log_up_to_date {
             node.voted_for = Some(req.candidate_id.clone());
             node.last_heartbeat = Instant::now();
+            info!(
+                "Node {} granted vote to candidate {}",
+                node.id, req.candidate_id
+            );
             Ok(Response::new(RequestVoteResponse {
                 term: current_term,
                 vote_granted: true,

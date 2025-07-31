@@ -18,7 +18,7 @@ use crate::internal_service::raft_internal_service_server::RaftInternalServiceSe
 use crate::nodes_services::{
     node_client_service::ClientServiceImpl, node_internal_service::RaftInternalServiceImpl,
 };
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tonic::transport::{Channel, Server};
 
 use futures::future::join_all;
@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Status};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::internal_service::raft_internal_service_client::RaftInternalServiceClient;
 use crate::internal_service::{
@@ -38,6 +38,7 @@ use crate::internal_service::{
 const MAX_BACKOFF_TIME: u64 = 30;
 const INITIAL_DELAY_MS: u64 = 2;
 const INTERVAL: u64 = 5; // seconds
+const MAJORITY_SIZE: usize = 2; // Minimum majority size for a 3-node cluster
 
 #[derive(Debug, Clone)]
 pub struct RaftNode {
@@ -57,6 +58,7 @@ pub struct RaftNode {
     pub election_timeout: Duration,
     pub peer_clients: HashMap<String, RaftInternalServiceClient<Channel>>,
     pub state_machine: HashMap<String, i32>,
+    pub last_applied: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,7 +89,7 @@ impl RaftNode {
                     info!("Connected to peer {}", peer.id);
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to connect to peer {}: {}", peer.id, e);
+                    warn!("Warning: Failed to connect to peer {}: {}", peer.id, e);
                 }
             }
         }
@@ -102,7 +104,7 @@ impl RaftNode {
         let client_address = node_config.client_address;
         let state = node_config.state;
         let role = node_config.role;
-        let election_timeout = Duration::from_secs(rand::rng().random_range(150..300));
+        let election_timeout = Duration::from_secs(rand::rng().random_range(20..50));
 
         let node = RaftNode {
             id,
@@ -121,6 +123,7 @@ impl RaftNode {
             last_heartbeat: Instant::now(),
             election_timeout,
             state_machine: HashMap::new(),
+            last_applied: 0,
         };
 
         info!(
@@ -180,6 +183,7 @@ impl RaftNode {
     pub async fn send_append_entries(
         &self,
         recipient_id: &str,
+        entries: Vec<LogEntry>,
     ) -> Result<AppendEntriesResponse, Status> {
         if self.state != NodeState::Leader {
             return Err(Status::failed_precondition("Not the leader"));
@@ -199,12 +203,6 @@ impl RaftNode {
                 prev_log_term = entry.term;
             }
         }
-
-        let entries = if next_index <= self.log.len() as i32 {
-            self.log[(next_index as usize - 1)..].to_vec()
-        } else {
-            vec![]
-        };
 
         info!(
             "Sending AppendEntries to {}: term={}, prev_log_index={}, prev_log_term={}, entries_count={}",
@@ -236,6 +234,7 @@ impl RaftNode {
 
         let peers = self.peers.clone();
         let mut tasks = vec![];
+        let mut should_force_commit = true;
 
         for peer in peers {
             let node = self.clone();
@@ -245,23 +244,43 @@ impl RaftNode {
                 node.term,
                 node.log.len()
             );
+            let next_index = self.next_index.get(&peer.id).cloned().unwrap_or(1);
+            let mut entries = if next_index <= self.log.len() as i32 {
+                self.log[(next_index as usize - 1)..].to_vec()
+            } else {
+                vec![]
+            };
+            if entries.is_empty() {
+                let commit_entry = LogEntry {
+                    term: node.term,
+                    index: node.log.len() as i32 + 1,
+                    entry_type: Some(EntryType::NoOp(1)), // Leader heartbeat
+                };
+
+                should_force_commit = false;
+                entries.push(commit_entry);
+            }
             tasks.push(tokio::spawn(async move {
-                let response = node.send_append_entries(&peer.id).await;
+                let response = node.send_append_entries(&peer.id, entries).await;
                 (peer.id, response)
             }));
         }
 
         let results = join_all(tasks).await;
 
+        let mut majority_count = 1; // Count self as a majority
         for result in results {
             let (peer_id, response) = match result {
-                Ok((peer_id, Ok(response))) => (peer_id, response),
+                Ok((peer_id, Ok(response))) => {
+                    majority_count += 1;
+                    (peer_id, response)
+                }
                 Ok((peer_id, Err(e))) => {
-                    eprintln!("Error sending AppendEntries to {}: {}", peer_id, e);
+                    warn!("Error sending AppendEntries to {}: {}", peer_id, e);
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("Task failed: {}", e);
+                    warn!("Task failed: {}", e);
                     continue;
                 }
             };
@@ -278,12 +297,86 @@ impl RaftNode {
                     .insert(peer_id.clone(), next_index - 1 + self.log.len() as i32);
                 self.next_index
                     .insert(peer_id.clone(), next_index + self.log.len() as i32);
+                self.commit_index = self
+                    .commit_index
+                    .max(self.match_index.get(&peer_id).copied().unwrap_or(0));
             } else {
                 let next_index = self.next_index.get(&peer_id).copied().unwrap_or(1);
                 self.next_index
                     .insert(peer_id, next_index.saturating_sub(1).max(1));
             }
         }
+
+        if majority_count >= MAJORITY_SIZE && should_force_commit {
+            self.replicate_forced_commit_log().await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn replicate_forced_commit_log(&mut self) -> Result<(), Status> {
+        if self.state != NodeState::Leader {
+            return Err(Status::failed_precondition("Not the leader"));
+        }
+
+        let peers = self.peers.clone();
+        let mut tasks = vec![];
+
+        for peer in peers {
+            let node = self.clone();
+            info!(
+                "Replicating log to peer {}: term={}, log_length={}",
+                peer.id,
+                node.term,
+                node.log.len()
+            );
+
+            let mut entries = vec![];
+            let commit_entry = LogEntry {
+                term: node.term,
+                index: node.log.len() as i32 + 1,
+                entry_type: Some(EntryType::NoOp(2)), // Forced commit
+            };
+            self.log.push(commit_entry.clone());
+
+            entries.push(commit_entry);
+            tasks.push(tokio::spawn(async move {
+                let response = node.send_append_entries(&peer.id, entries).await;
+                (peer.id, response)
+            }));
+        }
+
+        let results = join_all(tasks).await;
+
+        let mut majority_count = 0;
+        for result in results {
+            match result {
+                Ok((peer_id, Ok(response))) => {
+                    majority_count += 1;
+                    (peer_id, response)
+                }
+                Ok((peer_id, Err(e))) => {
+                    warn!(
+                        "Error sending forced commit AppendEntries to {}: {}",
+                        peer_id, e
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Task failed: {}", e);
+                    continue;
+                }
+            };
+        }
+
+        self.apply_committed_entries();
+
+        info!(
+            "Applied forced commit log entries, new commit index: {} and stage machine: {:?}",
+            self.commit_index, self.state_machine
+        );
+
+        info!("Forced commit log replicated to {} peers", majority_count);
 
         Ok(())
     }
@@ -317,67 +410,95 @@ impl RaftNode {
             last_log_term,
         });
 
-        let response = client.request_vote(request).await?;
-        Ok(response.into_inner())
+        let response = timeout(Duration::from_millis(1000), client.request_vote(request)).await;
+
+        match response {
+            Ok(Ok(response)) => {
+                info!("Received vote response from {}", recipient_id);
+                Ok(response.into_inner())
+            }
+            Ok(Err(e)) => {
+                warn!("RequestVote failed for {}: {}", recipient_id, e);
+                Err(e)
+            }
+            Err(_) => {
+                warn!("RequestVote timed out for {}", recipient_id);
+                Err(Status::deadline_exceeded(format!(
+                    "RequestVote timeout for {}",
+                    recipient_id
+                )))
+            }
+        }
     }
 
-    pub async fn start_election(&self) -> Result<(), Status> {
-        let mut node = self.clone();
-        node.term += 1;
-        node.state = NodeState::Candidate;
-        node.voted_for = Some(node.id.clone());
-        node.last_heartbeat = Instant::now();
+    pub async fn start_election(&mut self) -> Result<(), Status> {
+        self.term += 1;
+        self.state = NodeState::Candidate;
+        self.voted_for = Some(self.id.clone());
+        self.last_heartbeat = Instant::now();
 
-        let peers = node.peers.clone();
+        let peers = self.peers.clone();
         let mut votes = 1;
-        let majority = (peers.len() + 1) / 2 + 1;
-        let mut tasks = vec![];
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(peers.len());
 
         for peer in peers {
-            let node_clone = node.clone();
-            info!(
-                "Starting election: term={}, candidate_id={}, requesting vote from {}",
-                node_clone.term, node_clone.id, peer.id
-            );
-            tasks.push(tokio::spawn(async move {
-                let response = node_clone.send_request_vote(&peer.id).await;
-                (peer.id, response)
-            }));
+            let tx = tx.clone();
+            let node = self.clone();
+            tokio::spawn(async move {
+                let result = node.send_request_vote(&peer.id).await;
+                let _ = tx.send((peer.id, result)).await;
+            });
         }
 
-        let results = join_all(tasks).await;
+        drop(tx); // Close sender so the loop below ends when all responses come in
 
-        for result in results {
-            let (_peer_id, response) = match result {
-                Ok((peer_id, Ok(response))) => (peer_id, response),
-                Ok((peer_id, Err(e))) => {
-                    eprintln!("Error sending RequestVote to {}: {}", peer_id, e);
-                    continue;
-                }
+        while let Some((peer_id, result)) = rx.recv().await {
+            let response = match result {
+                Ok(response) => response,
                 Err(e) => {
-                    eprintln!("Task failed: {}", e);
+                    warn!("Error sending RequestVote to {}: {}", peer_id, e);
                     continue;
                 }
             };
 
-            if response.term > node.term {
-                node.term = response.term;
-                node.state = NodeState::Follower;
-                node.voted_for = None;
+            if response.term > self.term {
+                self.term = response.term;
+                self.state = NodeState::Follower;
+                self.voted_for = None;
                 return Ok(());
             }
+
             if response.vote_granted {
                 votes += 1;
             }
-        }
 
-        if votes >= majority {
-            node.state = NodeState::Leader;
-            node.voted_for = None;
-            for peer in &node.peers {
-                node.next_index
-                    .insert(peer.id.clone(), node.log.len() as i32 + 1);
-                node.match_index.insert(peer.id.clone(), 0);
+            info!(
+                "Received vote from {}: term={}, votes={} expecting {}",
+                peer_id, self.term, votes, MAJORITY_SIZE
+            );
+
+            let id = self.id.clone();
+
+            match votes >= MAJORITY_SIZE {
+                true => {
+                    self.state = NodeState::Leader;
+                    self.voted_for = None;
+
+                    for peer in &self.peers {
+                        self.next_index
+                            .insert(peer.id.clone(), self.log.len() as i32 + 1);
+                        self.match_index.insert(peer.id.clone(), 0);
+                    }
+
+                    info!(
+                        "Node {:?} won the election with {} votes in term {}",
+                        self, votes, self.term
+                    );
+
+                    return Ok(());
+                }
+                false => info!("Node {} has not reached majority: {}", id, votes),
             }
         }
 
@@ -385,8 +506,8 @@ impl RaftNode {
     }
 
     pub fn apply_committed_entries(&mut self) {
-        while self.commit_index as usize > self.state_machine.len() {
-            let index = self.state_machine.len();
+        while self.commit_index > self.last_applied {
+            let index = self.last_applied as usize;
             if let Some(entry) = self.log.get(index) {
                 let entry_type = entry.entry_type.clone().unwrap();
 
@@ -414,7 +535,13 @@ impl RaftNode {
                     }
                 }
             }
+            self.last_applied += 1;
         }
+
+        info!(
+            "Applied committed entries, new last_applied index: {}, state machine: {:?}",
+            self.last_applied, self.state_machine
+        );
     }
 }
 
@@ -463,21 +590,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state: NodeState::Follower,
             heartbeat: Instant::now(),
         },
-        // NodeConfig {
-        //     id: "node4".to_string(),
-        //     internal_address: "127.0.0.1:50054".to_string(),
-        //     client_address: "127.0.0.1:50064".to_string(),
-        //     status: NodeStatus::Active,
-        //     role: NodeRole::VotingMember,
-        //     state: NodeState::Follower,
-        //     heartbeat: Instant::now(),
-        // },
+        NodeConfig {
+            id: "node4".to_string(),
+            internal_address: "127.0.0.1:50054".to_string(),
+            client_address: "127.0.0.1:50064".to_string(),
+            status: NodeStatus::Active,
+            role: NodeRole::VotingMember,
+            state: NodeState::Follower,
+            heartbeat: Instant::now(),
+        },
     ];
 
     let node = match RaftNode::new(node_id.clone(), peers).await {
         Ok(node) => node,
         Err(e) => {
-            eprintln!("Failed to create Raft node: {}", e);
+            warn!("Failed to create Raft node: {}", e);
             return Err(Status::internal(format!("Failed to create Raft node: {}", e)).into());
         }
     };
@@ -486,7 +613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let internal_addr = match internal_address.parse() {
         Ok(addr) => addr,
         Err(e) => {
-            eprintln!("Invalid internal address: {}", e);
+            warn!("Invalid internal address: {}", e);
             return Err(Status::invalid_argument(format!(
                 "Invalid internal address: {}",
                 internal_address
@@ -504,7 +631,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .serve(internal_addr)
             .await
         {
-            eprintln!("Failed to start internal service: {}", e);
+            warn!("Failed to start internal service: {}", e);
         }
     });
 
@@ -519,7 +646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .serve(client_addr)
             .await
         {
-            eprintln!("Failed to start client service: {}", e);
+            warn!("Failed to start client service: {}", e);
         }
     });
 
@@ -538,13 +665,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             NodeState::Leader => {
                 info!("Node {} is the leader", node.id);
                 if let Err(e) = node.replicate_log().await {
-                    eprintln!("Replication failed: {}", e);
+                    warn!("Replication failed: {}", e);
                 }
             }
             NodeState::Follower | NodeState::Candidate => {
                 if node.last_heartbeat.elapsed() >= node.election_timeout {
                     if let Err(e) = node.start_election().await {
-                        eprintln!("Election failed: {}", e);
+                        warn!("Election failed: {}", e);
                     }
                 }
             }
