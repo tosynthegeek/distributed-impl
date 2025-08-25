@@ -37,8 +37,8 @@ use crate::internal_service::{
 
 const MAX_BACKOFF_TIME: u64 = 30;
 const INITIAL_DELAY_MS: u64 = 2;
-const INTERVAL: u64 = 5; // seconds
-const MAJORITY_SIZE: usize = 2; // Minimum majority size for a 3-node cluster
+const INTERVAL: u64 = 5;
+const MAJORITY_SIZE: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct RaftNode {
@@ -254,7 +254,7 @@ impl RaftNode {
                 let commit_entry = LogEntry {
                     term: node.term,
                     index: node.log.len() as i32 + 1,
-                    entry_type: Some(EntryType::NoOp(1)), // Leader heartbeat
+                    entry_type: Some(EntryType::NoOp(1)),
                 };
 
                 should_force_commit = false;
@@ -268,7 +268,7 @@ impl RaftNode {
 
         let results = join_all(tasks).await;
 
-        let mut majority_count = 1; // Count self as a majority
+        let mut majority_count = 1;
         for result in results {
             let (peer_id, response) = match result {
                 Ok((peer_id, Ok(response))) => {
@@ -335,7 +335,7 @@ impl RaftNode {
             let commit_entry = LogEntry {
                 term: node.term,
                 index: node.log.len() as i32 + 1,
-                entry_type: Some(EntryType::NoOp(2)), // Forced commit
+                entry_type: Some(EntryType::NoOp(2)),
             };
             self.log.push(commit_entry.clone());
 
