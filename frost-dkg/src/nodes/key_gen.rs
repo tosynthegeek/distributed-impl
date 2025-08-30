@@ -3,17 +3,20 @@ use frost::keys::{KeyPackage, PublicKeyPackage};
 use frost::{Error, Identifier};
 use frost_ristretto255 as frost;
 use futures::{Stream, StreamExt};
+use libp2p::Multiaddr;
 use libp2p::{PeerId, gossipsub::IdentTopic, identity, swarm::Swarm};
 use rand::rngs::OsRng;
 use std::collections::{BTreeMap, HashMap};
-use std::error::Error as StdError;
 use std::sync::Arc;
 use tokio::spawn;
 use tokio::sync::Mutex;
+use tracing::{error, warn};
 
-use crate::common::types::{Client, FrostEvent, Nodes, State};
-use crate::nodes::events::EventLoop;
+use crate::common::types::{FrostEvent, State};
+use crate::errors::FrostError;
+use crate::nodes::events::KadEventLoop;
 use crate::nodes::first_round::{MyBehaviour, broadcast_r1, receive_r1};
+use crate::nodes::nodes::Nodes;
 
 pub async fn perform_round_one(
     nodes: usize,
@@ -29,7 +32,7 @@ pub async fn perform_round_one(
         BTreeMap<Identifier, round1::Package>,
         HashMap<Identifier, PeerId>,
     ),
-    Box<dyn std::error::Error>,
+    FrostError,
 > {
     let rng = OsRng;
     let state_guard = state.lock().await;
@@ -62,42 +65,30 @@ pub async fn perform_round_one(
 }
 
 pub async fn perform_round_two(
-    peer_id: PeerId,
     nodes: usize,
-    mut network_client: Client,
+    mut node: Nodes,
     mut network_events: impl Stream<Item = FrostEvent> + Unpin,
-    network_event_loop: EventLoop,
+    network_event_loop: KadEventLoop,
     packages: BTreeMap<Identifier, round2::Package>,
     identifier_to_peers: HashMap<Identifier, PeerId>,
-    peer_to_addr: HashMap<PeerId, Nodes>,
-) -> Result<BTreeMap<Identifier, round2::Package>, Box<dyn StdError + Send>> {
+    _peer_to_addr: HashMap<PeerId, Multiaddr>,
+) -> Result<BTreeMap<Identifier, round2::Package>, FrostError> {
     let event_loop_handle = spawn(network_event_loop.run(packages.clone(), nodes));
 
-    let local_node = peer_to_addr
-        .get(&peer_id)
-        .ok_or("Local node address not found")
-        .expect("msg");
-    let addr = local_node.address.clone();
-    network_client.start_listening(addr).await?;
+    node.start_listening().await?;
 
     for (identifier, peer_id) in &identifier_to_peers {
         if let Some(package) = packages.get(identifier) {
-            let peer = peer_to_addr
-                .get(peer_id)
-                .ok_or("Peer address not found")
-                .expect("msg");
-
-            let peer_addr = peer.address.clone();
-            println!("Dialing peer {:?} at address {:?}", peer_id, peer_addr);
-
-            if let Err(e) = network_client.dial(*peer_id, peer_addr.clone()).await {
-                eprintln!("Failed to dial peer {:?}: {:?}", peer_id, e);
+            if let Err(e) = node.dial(*peer_id).await {
+                warn!(%peer_id, phase = "round2", error = ?e, "Failed to dial peer");
                 continue;
             }
 
-            match network_client.send_package(*peer_id, package.clone()).await {
-                Ok(_) => println!("Successfully sent package to peer {:?}", peer_id),
-                Err(e) => eprintln!("Failed to send package to peer {:?}: {:?}", peer_id, e),
+            match node.send_r2_package(*peer_id, package.clone()).await {
+                Ok(_) => {}
+                Err(e) => {
+                    error!(%peer_id, phase = "round2", error = ?e, "Failed to send package");
+                }
             }
         }
     }
@@ -107,22 +98,13 @@ pub async fn perform_round_two(
     while received_packages.len() < nodes - 1 {
         if let Some(event) = network_events.next().await {
             match event {
-                FrostEvent::InboundRequest { request, channel } => {
-                    println!("Received package: {:?}", request.0);
-
+                FrostEvent::InboundRequest { request, .. } => {
                     received_packages.push(request.0);
-
-                    network_client
-                        .send_acknowlegement(
-                            PeerId::random(), // TODO!
-                            channel,
-                        )
-                        .await;
                 }
             }
         }
     }
-    let collected_packages = event_loop_handle.await.expect("msg")?;
+    let collected_packages = event_loop_handle.await??;
 
     Ok(collected_packages)
 }
