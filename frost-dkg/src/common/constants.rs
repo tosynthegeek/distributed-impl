@@ -5,3 +5,6 @@ pub const TIMEOUT: u64 = 5000;
 pub const MAX_SIGNERS: u16 = 10;
 pub const MIN_SIGNERS: u16 = 3;
 pub const NODES: Vec<String> = Vec::new();
+pub const WAIT_FOR_PEERS: u64 = 30;
+pub const R1_TIMEOUT: u64 = 60;
+pub const R2_SWARM_TIMEOUT: u64 = 10;

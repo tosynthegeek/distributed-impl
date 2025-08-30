@@ -1,14 +1,11 @@
 use frost::keys::dkg::round2;
-use frost_ristretto255::Identifier;
 use frost_ristretto255::{self as frost};
 use futures::channel::{mpsc, oneshot};
 use libp2p::request_response::ResponseChannel;
 use libp2p::{Multiaddr, kad, request_response};
 use libp2p::{PeerId, swarm::NetworkBehaviour};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::error::Error;
-use tokio::sync::Mutex;
 
 pub struct PeerDetails {
     pub address: String,
@@ -21,13 +18,14 @@ pub enum NodeStatus {
     Failed,
 }
 
+#[derive(Debug, Clone)]
 // A struct for the values that would be determined by the protocol and not from the nodes or code.
 #[warn(dead_code)]
 pub struct State {
-    pub nodes: Vec<String>,
+    pub node_ids: Vec<String>,
+    pub node_ports: Vec<u16>,
     pub max_signers: u16,
     pub min_signers: u16,
-    pub identifier_to_peer_id: Mutex<HashMap<Identifier, PeerId>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,11 +82,4 @@ pub enum FrostEvent {
         request: MessageRequest,
         channel: ResponseChannel<MessageResponse>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Nodes {
-    pub port: u16,
-    pub peer_id: PeerId,
-    pub address: Multiaddr,
 }
