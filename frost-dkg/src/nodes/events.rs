@@ -15,14 +15,18 @@ use libp2p::{
     request_response::{self, OutboundRequestId},
     swarm::SwarmEvent,
 };
+use tracing::{error, info};
 
-use crate::common::types::{
-    Command, FrostEvent, MessageRequest, MessageResponse, Round2KadBehaviour,
-    Round2KadBehaviourEvent,
+use crate::{
+    common::types::{
+        Command, FrostEvent, MessageRequest, MessageResponse, Round2KadBehaviour,
+        Round2KadBehaviourEvent,
+    },
+    errors::FrostError,
 };
 
 #[allow(dead_code)]
-pub struct EventLoop {
+pub struct KadEventLoop {
     swarm: Swarm<Round2KadBehaviour>,
     command_receiver: mpsc::Receiver<Command>,
     event_sender: mpsc::Sender<FrostEvent>,
@@ -33,7 +37,7 @@ pub struct EventLoop {
         HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<u8>, Box<dyn Error + Send>>>>,
 }
 
-impl EventLoop {
+impl KadEventLoop {
     pub fn new(
         swarm: Swarm<Round2KadBehaviour>,
         command_receiver: mpsc::Receiver<Command>,
@@ -54,15 +58,14 @@ impl EventLoop {
         mut self,
         packages: BTreeMap<Identifier, round2::Package>,
         expected_packages: usize,
-    ) -> Result<BTreeMap<Identifier, round2::Package>, Box<dyn Error + Send>> {
+    ) -> Result<BTreeMap<Identifier, round2::Package>, FrostError> {
         let mut received_packages = BTreeMap::new();
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
-                    if let Some(package_info) = self.handle_event_with_collection(event, &packages).await {
+                    if let Some(package_info) = self.handle_event_with_collection(event, &packages).await? {
                         received_packages.insert(package_info.0, package_info.1);
 
-                        // Check if we've received all expected packages
                         if received_packages.len() >= expected_packages {
                             return Ok(received_packages);
                         }
@@ -70,10 +73,7 @@ impl EventLoop {
                 },
                 command = self.command_receiver.next() => match command {
                     Some(c) => self.handle_command(c, &packages).await,
-                    None => return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "Command channel closed"
-                    ))),
+                    None => return Err(FrostError::OperationFailed("Command channel closed".into())),
                 },
             }
         }
@@ -83,7 +83,7 @@ impl EventLoop {
         &mut self,
         event: SwarmEvent<Round2KadBehaviourEvent>,
         packages: &BTreeMap<Identifier, round2::Package>,
-    ) -> Option<(Identifier, round2::Package)> {
+    ) -> Result<Option<(Identifier, round2::Package)>, FrostError> {
         match event {
             SwarmEvent::Behaviour(Round2KadBehaviourEvent::Requestresponse(
                 request_response::Event::Message { message, peer, .. },
@@ -93,8 +93,7 @@ impl EventLoop {
                 } => {
                     println!("Received request {:?} from peer {:?}", request, peer);
                     let peer_id_bytes = peer.to_bytes();
-                    let identifier = frost::Identifier::derive(&peer_id_bytes)
-                        .expect("Failed to derive identifier");
+                    let identifier = frost::Identifier::derive(&peer_id_bytes)?;
 
                     let response = MessageResponse("Package received".to_string());
                     if let Err(e) = self
@@ -103,37 +102,38 @@ impl EventLoop {
                         .requestresponse
                         .send_response(channel, response)
                     {
-                        eprintln!("Failed to send response: {:?}", e);
+                        error!(%peer, phase = "round2", error = ?e, "Failed to send response");
                     }
 
-                    return Some((identifier, request.0));
+                    return Ok(Some((identifier, request.0)));
                 }
-                request_response::Message::Response { response, .. } => {
-                    println!("Received acknowledgment from {}: {:?}", peer, response.0);
+                request_response::Message::Response { .. } => {
+                    info!("Received acknowledgment from {}", peer);
                 }
             },
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                println!("Connection established with peer: {:?}", peer_id);
+                info!(%peer_id, phase = "round2", "Connection established with peer");
+
                 let peer_id_bytes = peer_id.to_bytes();
-                let identifier =
-                    frost::Identifier::derive(&peer_id_bytes).expect("Failed to derive identifier");
-                let packake = packages.get(&identifier)?;
+                let identifier = frost::Identifier::derive(&peer_id_bytes)?;
+                let packake = match packages.get(&identifier) {
+                    Some(pkg) => pkg,
+                    None => {
+                        error!(%peer_id, phase = "round2", "No package found for peer");
+                        return Ok(None);
+                    }
+                };
                 let request = MessageRequest(packake.clone());
                 let req_id = self
                     .swarm
                     .behaviour_mut()
                     .requestresponse
                     .send_request(&peer_id, request);
-                println!(
-                    "Sent package to peer {:?}, request ID: {:?}",
-                    peer_id, req_id
-                );
+                info!(%peer_id, %req_id, phase = "round2", "Sent package to peer");
             }
-            _ => {
-                println!("Unhandled event: {:?}", event);
-            }
+            _ => {}
         }
-        None
+        Ok(None)
     }
 
     async fn handle_command(
@@ -166,8 +166,6 @@ impl EventLoop {
                             let _ = sender.send(Err(Box::new(e)));
                         }
                     }
-                } else {
-                    todo!("Already dialing peer.");
                 }
             }
             Command::RequestMessage {
@@ -182,15 +180,10 @@ impl EventLoop {
                     .requestresponse
                     .send_request(&peer, request);
 
-                println!(
-                    "Sent package to peer {:?}, request ID: {:?}",
-                    peer, request_id
-                );
-                // Store the sender to respond when we get a response
+                info!(%peer, %request_id, "Sent request to peer");
                 self.pending_request_file.insert(request_id, sender);
             }
             Command::RespondMessage { peer, channel } => {
-                println!("Peer: {}", peer);
                 let response = MessageResponse("Acknowledgment sent".to_string());
                 if let Err(e) = self
                     .swarm
@@ -198,7 +191,7 @@ impl EventLoop {
                     .requestresponse
                     .send_response(channel, response)
                 {
-                    eprintln!("Failed to send response: {:?}", e);
+                    error!(%peer, "Failed to send response: {:?}", e);
                 }
             }
         }
